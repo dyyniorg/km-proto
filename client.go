@@ -2,6 +2,7 @@ package kmproto
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,20 +36,31 @@ func NewClient(userAgent string) *Client {
 	}
 	return &Client{
 		client: &http.Client{
-			Timeout: defaultReqTimeout,
-			// NOTE: server name indication (SNI) doesn't match when the cert host differs from the actual
-			// 		 connection host due to delegation -> needs to be overriden in thos ecases (should be
-			// 		 handled in discovery.go)
-			Transport: &http.Transport{},
+			Timeout:   defaultReqTimeout,
+			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 		},
 		userAgent: userAgent,
 	}
 }
 
+// Returns an http.Client whose TLS ServerName is sni when non-empty.
+// Used when the certificate host (sni) differs from the host dialed in rawURL.
+func (c *Client) dialClient(sni string) *http.Client {
+	if sni == "" {
+		return c.client
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: sni}
+	cl := *c.client
+	cl.Transport = tr
+	return &cl
+}
+
 // Performs a GET request to rawURL and returns the raw response body. The 'host' parameter, when
 // non-empty, overrides the request's Host header (needed when server name differs from the
-// resolved host:port used to connect, e.g. due to delegation).
-func (c *Client) Get(ctx context.Context, rawURL, host string) ([]byte, error) {
+// resolved host:port used to connect, e.g. due to delegation). Custom SNI can be used when the
+// cert host ('sni') differs from the dial host ('rawURL').
+func (c *Client) Get(ctx context.Context, rawURL, host, sni string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
@@ -59,7 +71,7 @@ func (c *Client) Get(ctx context.Context, rawURL, host string) ([]byte, error) {
 		req.Host = host
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := c.dialClient(sni).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("get request: %w", err)
 	}
@@ -77,9 +89,10 @@ func (c *Client) Get(ctx context.Context, rawURL, host string) ([]byte, error) {
 
 // Performs a GET request to rawURL (using c.Get()) and decodes the JSON response into out. The
 // 'host' parameter, when non-empty, overrides the request's Host header (needed when server name
-// differs from the resolved host:port used to connect, e.g. due to delegation).
-func (c *Client) GetJSON(ctx context.Context, rawURL, host string, out any) error {
-	body, err := c.Get(ctx, rawURL, host)
+// differs from the resolved host:port used to connect, e.g. due to delegation). Custom SNI can be
+// used when the cert host ('sni') differs from the dial host ('rawURL').
+func (c *Client) GetJSON(ctx context.Context, rawURL, host, sni string, out any) error {
+	body, err := c.Get(ctx, rawURL, host, sni)
 	if err != nil {
 		return err
 	}
