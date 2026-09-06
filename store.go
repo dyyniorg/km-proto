@@ -47,6 +47,14 @@ func (s *JSONStore) PutEdge(e Edge) error {
 	return nil
 }
 
+// record is a JSONL envelope carrying a single typed crawl result.
+type record struct {
+	Type   string  `json:"type"`
+	Server *Server `json:"server,omitempty"`
+	Room   *Room   `json:"room,omitempty"`
+	Edge   *Edge   `json:"edge,omitempty"`
+}
+
 // Writes all buffered records as JSONL in deterministic order: servers, rooms, and edges. Each
 // line is a JSON object with a "type" field and the record body under the corresponding key.
 func (s *JSONStore) Dump(w io.Writer) error {
@@ -54,18 +62,18 @@ func (s *JSONStore) Dump(w io.Writer) error {
 	defer s.mu.Unlock()
 
 	enc := json.NewEncoder(w)
-	for _, srv := range s.servers {
-		if err := enc.Encode(map[string]any{"type": "server", "server": srv}); err != nil {
+	for i := range s.servers {
+		if err := enc.Encode(record{Type: "server", Server: &s.servers[i]}); err != nil {
 			return err
 		}
 	}
-	for _, r := range s.rooms {
-		if err := enc.Encode(map[string]any{"type": "room", "room": r}); err != nil {
+	for i := range s.rooms {
+		if err := enc.Encode(record{Type: "room", Room: &s.rooms[i]}); err != nil {
 			return err
 		}
 	}
-	for _, e := range s.edges {
-		if err := enc.Encode(map[string]any{"type": "edge", "edge": e}); err != nil {
+	for i := range s.edges {
+		if err := enc.Encode(record{Type: "edge", Edge: &s.edges[i]}); err != nil {
 			return err
 		}
 	}
