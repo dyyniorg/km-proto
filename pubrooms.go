@@ -45,20 +45,25 @@ type publicRoom struct {
 	WorldReadable    bool   `json:"world_readable"`
 }
 
-// Fetches one page of rs's public room directory, returning Room records enriched with origin/alias
-// server names, and the cursor for the next page (or "" when exhausted). Uses the unauthenticated
-// client-server API endpoint.
-func (c *Client) PublicRooms(ctx context.Context, rs ResolvedServer, limit int, since string) ([]Room, string, error) {
+// Fetches one page of the server's public room directory, returning Room records enriched with
+// origin/alias server names, and the cursor for the next page (or "" when exhausted). Uses the
+// unauthenticated client-server API endpoint.
+func (c *Client) PublicRooms(ctx context.Context, name string, limit int, since string) ([]Room, string, error) {
+	base, err := c.clientBase(ctx, name)
+	if err != nil {
+		return nil, "", err
+	}
+
 	qp := url.Values{}
 	qp.Set("limit", strconv.Itoa(limit))
 	if since != "" {
 		qp.Set("since", since)
 	}
 
-	target := "https://" + rs.HostPort + "/_matrix/client/v3/publicRooms?" + qp.Encode()
+	target := base + "/_matrix/client/v3/publicRooms?" + qp.Encode()
 
 	var resp publicRoomsResponse
-	if err := c.GetJSON(ctx, target, rs.HostHeader, rs.CertName, &resp); err != nil {
+	if err := c.GetJSON(ctx, target, "", "", &resp); err != nil {
 		var he *HTTPError
 		if errors.As(err, &he) && (he.StatusCode == http.StatusNotFound || he.StatusCode == http.StatusMethodNotAllowed) {
 			return nil, "", errNoDirectory

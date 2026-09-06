@@ -155,7 +155,7 @@ func (c *Crawler) crawlServer(ctx context.Context, name string) {
 		if !c.budgetAllows() || ctx.Err() != nil {
 			return
 		}
-		rooms, next, err := c.client.PublicRooms(ctx, rs, c.limit, since)
+		rooms, next, err := c.client.PublicRooms(ctx, name, c.limit, since)
 		if err != nil {
 			if !errors.Is(err, errNoDirectory) {
 				c.logger.Printf("pubrooms %q: %v", name, err)

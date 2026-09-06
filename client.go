@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,6 +30,9 @@ func (he *HTTPError) Error() string {
 type Client struct {
 	client    *http.Client
 	userAgent string
+
+	cbMu sync.Mutex
+	cb   map[string]string // server name -> client-server base URL (no trailing slash)
 }
 
 func NewClient(userAgent string) *Client {
@@ -40,10 +45,11 @@ func NewClient(userAgent string) *Client {
 			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 		},
 		userAgent: userAgent,
+		cb:        make(map[string]string),
 	}
 }
 
-// Returns an http.Client whose TLS ServerName is sni when non-empty.
+// Returns a http.Client whose TLS ServerName is sni when non-empty.
 // Used when the certificate host (sni) differs from the host dialed in rawURL.
 func (c *Client) dialClient(sni string) *http.Client {
 	if sni == "" {
@@ -100,4 +106,35 @@ func (c *Client) GetJSON(ctx context.Context, rawURL, host, sni string, out any)
 		return fmt.Errorf("decoding json: %w", err)
 	}
 	return nil
+}
+
+// Resolves the client-server base URL for a homeserver name via its
+// /.well-known/matrix/client delegation (m.homeserver.base_url), falling back to
+// https://<name> when the file is absent. The result is cached; the returned URL
+// has no trailing slash. This is separate from the federation target resolved by
+// Resolver.Resolve, since the client and federation APIs may live on different
+// hosts (e.g. matrix.org vs matrix-federation.matrix.org).
+func (c *Client) clientBase(ctx context.Context, name string) (string, error) {
+	c.cbMu.Lock()
+	if base, ok := c.cb[name]; ok {
+		c.cbMu.Unlock()
+		return base, nil
+	}
+	c.cbMu.Unlock()
+
+	base := "https://" + name
+
+	var wk struct {
+		Homeserver struct {
+			BaseURL string `json:"base_url"`
+		} `json:"m.homeserver"`
+	}
+	if err := c.GetJSON(ctx, base+"/.well-known/matrix/client", "", "", &wk); err == nil && wk.Homeserver.BaseURL != "" {
+		base = strings.TrimRight(wk.Homeserver.BaseURL, "/")
+	}
+
+	c.cbMu.Lock()
+	c.cb[name] = base
+	c.cbMu.Unlock()
+	return base, nil
 }
