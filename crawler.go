@@ -16,6 +16,20 @@ var (
 	}
 )
 
+const (
+	// NOTE: long period, primarily aimed towards longer running daemon-like usage
+	defaultReportEvery = 15 * time.Minute
+)
+
+// Final tally of a crawl run, returned once the BFS queue drains.
+type CrawlStats struct {
+	ServersVisited int           // total servers dequeued and processed
+	ServersFound   int           // reachable servers recorded via fingerprinting
+	RoomsFound     int           // unique public rooms recorded
+	EdgesFound     int           // unique directed server-to-server edges recorded
+	Elapsed        time.Duration // wall-clock duration of the crawl
+}
+
 type Crawler struct {
 	client   *Client
 	store    Store
@@ -36,9 +50,14 @@ type Crawler struct {
 	serversVisited int // compared against the optional maxServers budget
 
 	logger *log.Logger
+
+	summaryPeriod time.Duration
+
+	roomsFound int // unique items
+	edgesFound int // unique items
 }
 
-func NewCrawler(client *Client, store Store, logger *log.Logger, seeds []string, limit, workers, maxServers int) *Crawler {
+func NewCrawler(client *Client, store Store, logger *log.Logger, seeds []string, limit, workers, maxServers int, summaryPeriod time.Duration) *Crawler {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -57,18 +76,22 @@ func NewCrawler(client *Client, store Store, logger *log.Logger, seeds []string,
 	if workers <= 0 {
 		workers = 8
 	}
+	if summaryPeriod <= 0 {
+		summaryPeriod = defaultReportEvery
+	}
 	c := &Crawler{
-		client:      client,
-		store:       store,
-		resolver:    NewResolver(client),
-		seeds:       seeds,
-		limit:       limit,
-		workers:     workers,
-		maxServers:  maxServers,
-		seenServers: make(map[string]bool),
-		seenRooms:   make(map[string]bool),
-		seenEdges:   make(map[string]bool),
-		logger:      logger,
+		client:        client,
+		store:         store,
+		resolver:      NewResolver(client),
+		seeds:         seeds,
+		limit:         limit,
+		workers:       workers,
+		maxServers:    maxServers,
+		seenServers:   make(map[string]bool),
+		seenRooms:     make(map[string]bool),
+		seenEdges:     make(map[string]bool),
+		logger:        logger,
+		summaryPeriod: summaryPeriod,
 	}
 	c.waiter = sync.NewCond(&c.mu)
 	return c
@@ -76,13 +99,16 @@ func NewCrawler(client *Client, store Store, logger *log.Logger, seeds []string,
 
 // Breadth-first walk of the federation network, starting from the defined/default seed servers.
 // Context can be set to cancel the crawl early (using a timeout) or alternatively maxServers can
-// be set (via NewCrawler) to bound the max. number of servers visited by the crawler.
-func (c *Crawler) Crawl(ctx context.Context) error {
+// be set (via NewCrawler) to bound the max. number of servers visited by the crawler. Progress is
+// logged at the configured interval, and a final tally is returned once the queue drains.
+func (c *Crawler) Crawl(ctx context.Context) (CrawlStats, error) {
 	c.mu.Lock()
 	for _, s := range c.seeds {
 		c.enqueueLocked(s)
 	}
 	c.mu.Unlock()
+
+	start := time.Now()
 
 	work := make(chan string)
 	var wg sync.WaitGroup
@@ -112,8 +138,49 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 		}
 	}()
 
-	wg.Wait()
-	return nil
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	ticker := time.NewTicker(c.summaryPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.logProgress(time.Since(start))
+		case <-done:
+			return c.finalStats(start), nil
+		case <-ctx.Done():
+			return c.finalStats(start), ctx.Err()
+		}
+	}
+}
+
+// Snapshots the counters and elapsed time under the mutex.
+func (c *Crawler) finalStats(start time.Time) CrawlStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return CrawlStats{
+		ServersVisited: c.serversVisited,
+		ServersFound:   len(c.seenServers),
+		RoomsFound:     c.roomsFound,
+		EdgesFound:     c.edgesFound,
+		Elapsed:        time.Since(start),
+	}
+}
+
+// Emits a single summary line of the crawl's progress so far.
+func (c *Crawler) logProgress(elapsed time.Duration) {
+	c.mu.Lock()
+	visited := c.serversVisited
+	rooms := c.roomsFound
+	edges := c.edgesFound
+	queued := len(c.queue)
+	active := c.active
+	c.mu.Unlock()
+	c.logger.Printf("progress: visited=%d queued=%d active=%d rooms=%d edges=%d elapsed=%s", visited, queued, active, rooms, edges, elapsed.Round(time.Second))
 }
 
 // Blocks until a server name is available or the queue is empty and no visits are in-flight (i.e.
@@ -216,6 +283,7 @@ func (c *Crawler) maybePutRoom(r Room) {
 		return
 	}
 	c.seenRooms[r.RoomID] = true
+	c.roomsFound++
 	c.store.PutRoom(r)
 }
 
@@ -227,6 +295,7 @@ func (c *Crawler) maybePutEdge(source string, r Room) {
 		return
 	}
 	c.seenEdges[key] = true
+	c.edgesFound++
 	c.store.PutEdge(Edge{
 		SourceServer: source,
 		TargetServer: r.OriginServer,
