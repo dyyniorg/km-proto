@@ -3,6 +3,7 @@ package kmproto
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -33,9 +34,14 @@ type Crawler struct {
 	waiter         *sync.Cond
 	active         int // in-flight server visits
 	serversVisited int // compared against the optional maxServers budget
+
+	logger *log.Logger
 }
 
-func NewCrawler(client *Client, store Store, seeds []string, limit, workers, maxServers int) *Crawler {
+func NewCrawler(client *Client, store Store, logger *log.Logger, seeds []string, limit, workers, maxServers int) *Crawler {
+	if logger == nil {
+		logger = log.Default()
+	}
 	if client == nil {
 		client = NewClient("")
 	}
@@ -62,6 +68,7 @@ func NewCrawler(client *Client, store Store, seeds []string, limit, workers, max
 		seenServers: make(map[string]bool),
 		seenRooms:   make(map[string]bool),
 		seenEdges:   make(map[string]bool),
+		logger:      logger,
 	}
 	c.waiter = sync.NewCond(&c.mu)
 	return c
@@ -110,7 +117,7 @@ func (c *Crawler) Crawl(ctx context.Context) error {
 }
 
 // Blocks until a server name is available or the queue is empty and no visits are in-flight (i.e.
-// the crawl is finished). Returns the next server name, incrementing active count, or ok=false 
+// the crawl is finished). Returns the next server name, incrementing active count, or ok=false
 // when the crawl is complete.
 func (c *Crawler) dequeue() (string, bool) {
 	c.mu.Lock()
@@ -127,8 +134,8 @@ func (c *Crawler) dequeue() (string, bool) {
 	return name, true
 }
 
-// Visits a single homeserver, resolves its name, fingerprints it, drains the serer's published 
-// room directory page by page, and records each room plus an edge to the room's origin server, 
+// Visits a single homeserver, resolves its name, fingerprints it, drains the server's published
+// room directory page by page, and records each room plus an edge to the room's origin server,
 // enqueuing newly seen servers into the BFS queue. Defers 'markDone' call so active/
 // serversVisited are maintained on every exit path regardless of the outcome.
 func (c *Crawler) crawlServer(ctx context.Context, name string) {
@@ -151,7 +158,7 @@ func (c *Crawler) crawlServer(ctx context.Context, name string) {
 		rooms, next, err := c.client.PublicRooms(ctx, rs, c.limit, since)
 		if err != nil {
 			if !errors.Is(err, errNoDirectory) {
-				// TODO: log transient failure; keep crawling other servers
+				c.logger.Printf("pubrooms %q: %v", name, err)
 			}
 			return
 		}
@@ -180,9 +187,8 @@ func (c *Crawler) markDone() {
 	c.mu.Unlock()
 }
 
-// NOTE: Briefly overshoots the maximum amount, as in-flight items are let to complete before 
-//		 cutting the power off.
 func (c *Crawler) budgetAllows() bool {
+	// NOTE: briefly overshoots max. amount due to in-flight requests completing before cutting power
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.maxServers == 0 || c.serversVisited < c.maxServers
